@@ -79,6 +79,26 @@ struct FfmSlotFields {
     std::string type;  ///< ffmTypeN value ("?" or a material name)
 };
 
+/// Compare the user-visible/persisted payload of two lane_data overrides.
+/// `updated_at` is intentionally excluded: it is conflict-resolution metadata,
+/// not slot state. An external writer may refresh the timestamp without changing
+/// anything HelixScreen renders; treating that as a change would repaint the AMS
+/// UI on every resync for no user-visible benefit.
+[[nodiscard]] bool lane_override_equivalent(const helix::ams::FilamentSlotOverride& a,
+                                             const helix::ams::FilamentSlotOverride& b) {
+    return a.brand == b.brand && a.spool_name == b.spool_name &&
+           a.spoolman_id == b.spoolman_id &&
+           a.spoolman_vendor_id == b.spoolman_vendor_id &&
+           a.remaining_weight_g == b.remaining_weight_g &&
+           a.total_weight_g == b.total_weight_g && a.color_rgb == b.color_rgb &&
+           a.color_set == b.color_set && a.color_name == b.color_name &&
+           a.material == b.material && a.catalog_id == b.catalog_id &&
+           a.product_name == b.product_name &&
+           a.user_locked_color == b.user_locked_color &&
+           a.user_locked_material == b.user_locked_material &&
+           a.bed_temp == b.bed_temp && a.nozzle_temp == b.nozzle_temp;
+}
+
 /// zmod's own fallback colour, from `gcmd.get('HEX', '161616')` in
 /// zmod_color.py's cmd_RUN_ZCOLOR.
 constexpr const char* ZMOD_DEFAULT_HEX = "161616";
@@ -410,10 +430,12 @@ void AmsBackendAd5xIfs::on_stopping() {
 }
 
 void AmsBackendAd5xIfs::request_resync() {
-    spdlog::info("{} request_resync(): re-reading Adventurer5M.json + GET_ZCOLOR",
-                 backend_log_tag());
+    spdlog::info(
+        "{} request_resync(): re-reading Adventurer5M.json + GET_ZCOLOR + lane_data",
+        backend_log_tag());
     read_adventurer_json();
     schedule_zcolor_query("manual_resync");
+    schedule_lane_data_reload("manual_resync");
 }
 
 // --- Status parsing ---
@@ -678,6 +700,14 @@ void AmsBackendAd5xIfs::handle_status_update(const json& notification) {
     if (should_poll_json(printing_now, json_poll_was_printing_, now - last_json_poll_kick_)) {
         last_json_poll_kick_ = now;
         poll_adventurer_json();
+    }
+
+    // External integrations can update shared Moonraker lane_data immediately
+    // before starting a job. Moonraker has no database-change notification, so
+    // use the already-observed idle->PRINTING edge as a cheap one-shot
+    // reconciliation point. This is deliberately NOT periodic polling.
+    if (printing_now && !json_poll_was_printing_) {
+        schedule_lane_data_reload("print_start");
     }
     json_poll_was_printing_ = printing_now;
 }
@@ -3241,6 +3271,120 @@ std::vector<std::string> AmsBackendAd5xIfs::parse_user_cfg_filament_types(const 
         }
     }
     return out;
+}
+
+void AmsBackendAd5xIfs::schedule_lane_data_reload(const char* reason) {
+    if (!api_) {
+        return;
+    }
+    if (lane_data_reload_in_flight_.exchange(true)) {
+        spdlog::trace("{} lane_data reload already in flight; coalescing trigger '{}'",
+                      backend_log_tag(), reason ? reason : "unknown");
+        return;
+    }
+
+    const std::string why = reason ? reason : "unknown";
+    auto token = lifetime_.token();
+    api_->database_get_namespace(
+        "lane_data",
+        [this, token, why](const json& namespace_doc) {
+            // Moonraker callback thread: marshal every member write and UI event
+            // to the main thread. The JSON value is an owned copy at this point.
+            token.defer("Ad5xIfsBackend::lane_data_reload_apply",
+                        [this, why, namespace_doc]() mutable {
+                            lane_data_reload_in_flight_.store(false);
+                            apply_lane_data_snapshot(namespace_doc, why.c_str());
+                        });
+        },
+        [this, token, why](const MoonrakerError& err) {
+            const std::string message = err.message;
+            token.defer("Ad5xIfsBackend::lane_data_reload_error",
+                        [this, why, message]() {
+                            lane_data_reload_in_flight_.store(false);
+                            // lane_data is interoperability metadata, never print-
+                            // critical. A failed refresh leaves the last-known
+                            // overrides intact and the next resync/print edge retries.
+                            spdlog::debug("{} lane_data reload '{}' failed: {}",
+                                          backend_log_tag(), why, message);
+                        });
+        });
+}
+
+void AmsBackendAd5xIfs::apply_lane_data_snapshot(const json& namespace_doc,
+                                                 const char* reason) {
+    if (!namespace_doc.is_object()) {
+        spdlog::debug("{} lane_data reload '{}': namespace is not an object; ignoring",
+                      backend_log_tag(), reason ? reason : "unknown");
+        return;
+    }
+
+    // Build a complete physical-lane snapshot before touching live state. A
+    // canonical `laneN` record wins over any duplicate alias that resolves to the
+    // same inner lane number. This matches FilamentSlotOverrideStore's writer and
+    // avoids a stale third-party duplicate winning merely by JSON key order.
+    std::unordered_map<int, helix::ams::FilamentSlotOverride> incoming;
+    std::unordered_map<int, bool> canonical_seen;
+    for (auto it = namespace_doc.begin(); it != namespace_doc.end(); ++it) {
+        auto parsed = helix::ams::from_lane_data_record(it.value());
+        if (!parsed.has_value()) {
+            continue; // `seated`, malformed records, unrelated scalar keys
+        }
+        const int slot = parsed->first;
+        if (slot < 0 || slot >= NUM_PORTS) {
+            continue; // bypass lane / foreign larger AMS units are not ours
+        }
+        const bool canonical = it.key() == ("lane" + std::to_string(slot + 1));
+        auto existing = incoming.find(slot);
+        if (existing == incoming.end() || (canonical && !canonical_seen[slot])) {
+            incoming[slot] = std::move(parsed->second);
+            canonical_seen[slot] = canonical;
+        }
+    }
+
+    std::vector<int> changed_slots;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int slot = 0; slot < NUM_PORTS; ++slot) {
+            auto old_it = overrides_.find(slot);
+            auto new_it = incoming.find(slot);
+            bool changed = false;
+            if (new_it == incoming.end()) {
+                if (old_it != overrides_.end()) {
+                    overrides_.erase(old_it);
+                    changed = true;
+                }
+            } else if (old_it == overrides_.end()) {
+                overrides_[slot] = new_it->second;
+                changed = true;
+            } else if (lane_override_equivalent(old_it->second, new_it->second)) {
+                // Keep conflict-resolution metadata current even when the
+                // user-visible payload is unchanged. Timestamp-only refreshes
+                // must not repaint the lane, but retaining an older scan_time
+                // would make our in-memory snapshot stale.
+                old_it->second.updated_at = new_it->second.updated_at;
+            } else {
+                old_it->second = new_it->second;
+                changed = true;
+            }
+
+            if (changed) {
+                update_slot_from_state(slot);
+                changed_slots.push_back(slot);
+            }
+        }
+    }
+
+    if (changed_slots.empty()) {
+        spdlog::trace("{} lane_data reload '{}': no physical-slot changes",
+                      backend_log_tag(), reason ? reason : "unknown");
+        return;
+    }
+
+    spdlog::info("{} lane_data reload '{}': applied {} external slot change(s)",
+                 backend_log_tag(), reason ? reason : "unknown", changed_slots.size());
+    for (int slot : changed_slots) {
+        emit_event(EVENT_SLOT_CHANGED, std::to_string(slot));
+    }
 }
 
 void AmsBackendAd5xIfs::read_adventurer_json() {

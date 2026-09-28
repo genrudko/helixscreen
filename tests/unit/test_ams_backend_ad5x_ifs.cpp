@@ -5868,6 +5868,194 @@ TEST_CASE("AD5X IFS pure black (#000000) is a real reading, not a no-signal sent
 }
 
 // ------------------------------------------------------------------
+
+// Live lane_data reconciliation: HelixScreen historically loaded this shared
+// namespace only once in on_started(). External writers therefore changed the
+// database successfully while the running AD5X screen kept stale slot metadata.
+
+TEST_CASE("AD5X IFS live lane_data snapshot updates Spoolman assignment immediately",
+          "[ams][ad5x_ifs][filament_slot_override][lane_data]") {
+    AmsBackendAd5xIfs backend(nullptr, nullptr);
+
+    Ad5xIfsTestAccess::set_port_presence(backend, 0, true);
+    Ad5xIfsTestAccess::set_color(backend, 0, "112233");
+    Ad5xIfsTestAccess::set_material(backend, 0, "PLA");
+
+    helix::ams::FilamentSlotOverride old;
+    old.brand = "Old Vendor";
+    old.spool_name = "Old Spool";
+    old.spoolman_id = 7;
+    Ad5xIfsTestAccess::seed_override(backend, 0, old);
+    Ad5xIfsTestAccess::set_port_presence(backend, 0, true);
+    REQUIRE(backend.get_slot_info(0).spoolman_id == 7);
+
+    const json snapshot = {
+        {"lane1", {{"lane", "0"},
+                   {"vendor", "Geek Fil/ament"},
+                   {"name", "Black"},
+                   {"spool_id", 15},
+                   {"material", "PLA"},
+                   {"color", "#000000"},
+                   {"remaining_weight", 391.0},
+                   {"weight", 1000.0},
+                   {"scan_time", "2026-08-29T12:00:00Z"}}}
+    };
+
+    Ad5xIfsTestAccess::apply_lane_data_snapshot(backend, snapshot, "unit_test");
+
+    auto staged = Ad5xIfsTestAccess::get_override(backend, 0);
+    REQUIRE(staged.has_value());
+    CHECK(staged->spoolman_id == 15);
+    CHECK(staged->brand == "Geek Fil/ament");
+
+    const auto info = backend.get_slot_info(0);
+    CHECK(info.spoolman_id == 15);
+    CHECK(info.brand == "Geek Fil/ament");
+    CHECK(info.material == "PLA");
+    CHECK(info.color_rgb == 0x000000u);
+
+    // A timestamp-only external refresh is conflict metadata, not a visible
+    // lane change. It should still advance the in-memory timestamp so a later
+    // reconciliation does not carry stale writer-order information.
+    json timestamp_only = snapshot;
+    timestamp_only["lane1"]["scan_time"] = "2026-08-29T12:00:01Z";
+    const auto before_stamp = staged->updated_at;
+    Ad5xIfsTestAccess::apply_lane_data_snapshot(backend, timestamp_only, "unit_test_timestamp");
+    auto refreshed = Ad5xIfsTestAccess::get_override(backend, 0);
+    REQUIRE(refreshed.has_value());
+    CHECK(refreshed->updated_at > before_stamp);
+}
+
+TEST_CASE("AD5X IFS live lane_data snapshot clears externally removed assignment",
+          "[ams][ad5x_ifs][filament_slot_override][lane_data]") {
+    AmsBackendAd5xIfs backend(nullptr, nullptr);
+    Ad5xIfsTestAccess::set_port_presence(backend, 1, true);
+    Ad5xIfsTestAccess::set_color(backend, 1, "00FF00");
+    Ad5xIfsTestAccess::set_material(backend, 1, "PETG");
+
+    helix::ams::FilamentSlotOverride saved;
+    saved.brand = "Saved Vendor";
+    saved.spoolman_id = 22;
+    Ad5xIfsTestAccess::seed_override(backend, 1, saved);
+    Ad5xIfsTestAccess::set_port_presence(backend, 1, true);
+    REQUIRE(backend.get_slot_info(1).spoolman_id == 22);
+
+    const json snapshot = {{"seated", 1}};
+    Ad5xIfsTestAccess::apply_lane_data_snapshot(backend, snapshot, "unit_test_clear");
+
+    CHECK_FALSE(Ad5xIfsTestAccess::get_override(backend, 1).has_value());
+    const auto info = backend.get_slot_info(1);
+    CHECK(info.spoolman_id == 0);
+    CHECK(info.brand.empty());
+    CHECK(info.material == "PETG");
+    CHECK(info.color_rgb == 0x00FF00u);
+}
+
+TEST_CASE("AD5X IFS live lane_data prefers canonical laneN and ignores foreign lanes",
+          "[ams][ad5x_ifs][filament_slot_override][lane_data]") {
+    AmsBackendAd5xIfs backend(nullptr, nullptr);
+    Ad5xIfsTestAccess::set_port_presence(backend, 0, true);
+    Ad5xIfsTestAccess::set_color(backend, 0, "808080");
+    Ad5xIfsTestAccess::set_material(backend, 0, "PLA");
+
+    const json snapshot = {
+        {"T0", {{"lane", "0"}, {"spool_id", 999}, {"vendor", "Wrong"}}},
+        {"lane1", {{"lane", "0"}, {"spool_id", 42}, {"vendor", "Canonical"}}},
+        {"lane5", {{"lane", "4"}, {"spool_id", 1234}, {"vendor", "Bypass"}}},
+        {"garbage", {{"spool_id", 88}}}
+    };
+
+    Ad5xIfsTestAccess::apply_lane_data_snapshot(backend, snapshot, "unit_test_duplicates");
+
+    auto staged = Ad5xIfsTestAccess::get_override(backend, 0);
+    REQUIRE(staged.has_value());
+    CHECK(staged->spoolman_id == 42);
+    CHECK(staged->brand == "Canonical");
+    CHECK_FALSE(Ad5xIfsTestAccess::get_override(backend, 3).has_value());
+}
+
+
+TEST_CASE("AD5X IFS request_resync trigger reloads external lane_data",
+          "[ams][ad5x_ifs][filament_slot_override][lane_data][trigger]") {
+    MoonrakerClientMock client(MoonrakerClientMock::PrinterType::VORON_24);
+    helix::PrinterState state;
+    state.init_subjects(false);
+    MoonrakerAPIMock api(client, state);
+    AmsBackendAd5xIfs backend(&api, nullptr);
+    Ad5xIfsTestAccess::set_zcolor_supported(backend, false);
+    Ad5xIfsTestAccess::set_port_presence(backend, 0, true);
+
+    helix::ams::FilamentSlotOverride old;
+    old.brand = "Before";
+    old.spoolman_id = 7;
+    Ad5xIfsTestAccess::seed_override(backend, 0, old);
+
+    api.mock_defer_next_db_get();
+    backend.request_resync();
+
+    const json snapshot = {{"lane1", {{"lane", "0"},
+                                      {"vendor", "After"},
+                                      {"spool_id", 77},
+                                      {"material", "PLA"},
+                                      {"color", "#123456"},
+                                      {"scan_time", "2026-08-29T12:34:56Z"}}}};
+    api.fire_deferred_db_get_success(snapshot);
+    helix::ui::UpdateQueue::instance().drain();
+
+    auto refreshed = Ad5xIfsTestAccess::get_override(backend, 0);
+    REQUIRE(refreshed.has_value());
+    CHECK(refreshed->brand == "After");
+    CHECK(refreshed->spoolman_id == 77);
+}
+
+TEST_CASE("AD5X IFS print-start edge reloads external lane_data once",
+          "[ams][ad5x_ifs][filament_slot_override][lane_data][trigger]") {
+    MoonrakerClientMock client(MoonrakerClientMock::PrinterType::VORON_24);
+    helix::PrinterState state;
+    state.init_subjects(false);
+    MoonrakerAPIMock api(client, state);
+    AmsBackendAd5xIfs backend(&api, nullptr);
+    Ad5xIfsTestAccess::set_zcolor_supported(backend, false);
+    Ad5xIfsTestAccess::set_port_presence(backend, 1, true);
+
+    helix::ams::FilamentSlotOverride old;
+    old.brand = "Before";
+    old.spoolman_id = 8;
+    Ad5xIfsTestAccess::seed_override(backend, 1, old);
+
+    auto& printer_state = get_printer_state();
+    if (!printer_state.are_subjects_initialized()) {
+        printer_state.init_subjects(false);
+    }
+    helix::test::set_wire_state(printer_state, helix::PrintJobState::STANDBY);
+
+    api.mock_defer_next_db_get();
+    helix::test::set_wire_state(printer_state, helix::PrintJobState::PRINTING);
+    Ad5xIfsTestAccess::handle_status(backend, json::object());
+
+    const json snapshot = {{"lane2", {{"lane", "1"},
+                                      {"vendor", "PrintStart"},
+                                      {"spool_id", 88},
+                                      {"material", "PETG"},
+                                      {"color", "#00AA00"},
+                                      {"scan_time", "2026-08-29T12:35:00Z"}}}};
+    api.fire_deferred_db_get_success(snapshot);
+    helix::ui::UpdateQueue::instance().drain();
+
+    auto refreshed = Ad5xIfsTestAccess::get_override(backend, 1);
+    REQUIRE(refreshed.has_value());
+    CHECK(refreshed->brand == "PrintStart");
+    CHECK(refreshed->spoolman_id == 88);
+
+    api.mock_defer_next_db_get();
+    Ad5xIfsTestAccess::handle_status(backend, json::object());
+    api.fire_deferred_db_get_success(json{{"lane2", {{"lane", "1"}, {"spool_id", 99}}}});
+    helix::ui::UpdateQueue::instance().drain();
+    CHECK(Ad5xIfsTestAccess::get_override(backend, 1)->spoolman_id == 88);
+
+    helix::test::set_wire_state(printer_state, helix::PrintJobState::STANDBY);
+}
+
 // Task 16: explicit clear_slot_override — user pressed "Clear slot metadata".
 // Verifies the same clear pathway used by hardware-event detection is
 // reachable through the public API with no swap signal required.

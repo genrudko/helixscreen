@@ -728,6 +728,15 @@ class AmsBackendAd5xIfs : public AmsSubscriptionBackend {
     void unlock_auto_tracked_override_on_insert_locked(int slot_index);
     void parse_adventurer_json(const std::string& content);
     void read_adventurer_json();
+    // Re-read the shared Moonraker lane_data namespace without blocking the UI.
+    // Used only on explicit backend resync and the idle->printing edge; Moonraker
+    // provides no database-change notification, so this closes the external-
+    // writer gap without a permanent polling loop.
+    void schedule_lane_data_reload(const char* reason);
+    // Apply one authoritative lane_data namespace snapshot to physical IFS slots
+    // 0..3. Missing records clear stale overrides; bypass/foreign lanes are ignored.
+    // Caller must NOT hold mutex_.
+    void apply_lane_data_snapshot(const nlohmann::json& namespace_doc, const char* reason);
     void register_zcolor_listener();
     // Listener body — extracted so tests can drive it directly without a live
     // MoonrakerClient. Returns true if the line was buffered as part of an
@@ -1340,6 +1349,9 @@ class AmsBackendAd5xIfs : public AmsSubscriptionBackend {
     // under mutex_ (via update_slot_from_state).
     std::unique_ptr<helix::ams::FilamentSlotOverrideStore> override_store_;
     std::unordered_map<int, helix::ams::FilamentSlotOverride> overrides_;
+    // Coalesces explicit/print-edge lane_data refreshes. The Moonraker callback
+    // arrives off the UI thread; the snapshot itself is applied via lifetime_.defer.
+    std::atomic<bool> lane_data_reload_in_flight_{false};
 
     // Resolved on-disk path of Adventurer5M.json when helix-screen runs on the
     // same host as Moonraker. Empty string means "fall back to Moonraker HTTP

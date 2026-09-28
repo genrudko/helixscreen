@@ -305,6 +305,12 @@ class Ad5xIfsTestAccess {
             return std::nullopt;
         return it->second;
     }
+    // Apply an externally-read lane_data namespace snapshot through the same
+    // production reconciliation path used by request_resync()/print-start.
+    static void apply_lane_data_snapshot(AmsBackendAd5xIfs& b, const json& doc,
+                                         const char* reason = "test") {
+        b.apply_lane_data_snapshot(doc, reason);
+    }
     // Inject an override store so persist=true set_slot_info has somewhere to
     // write. Production creates the store inside on_started(); tests that
     // build the backend with a concrete MoonrakerAPIMock but never call
